@@ -56,6 +56,7 @@ htmlcov/
 # IDE and OS files
 .vscode/
 .idea/
+/app
 *.swp
 *.swo
 *~
