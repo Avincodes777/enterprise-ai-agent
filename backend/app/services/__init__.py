@@ -17,6 +17,17 @@ from .embedding import (
     MockEmbeddingService,
     get_embedding_service,
 )
+from .llm import (
+    BaseLLMService,
+    LLMConfigurationError,
+    LLMError,
+    LLMProviderError,
+    LLMResponseError,
+    LLMValidationError,
+    MockLLMService,
+    OpenAIChatService,
+    get_llm_service,
+)
 from .pdf_loader import (
     PDFDocument,
     PDFEncryptedError,
@@ -26,6 +37,13 @@ from .pdf_loader import (
     extract_pdf_text,
     load_pdf,
     load_pdf_from_bytes,
+)
+from .retriever import (
+    BaseRetriever,
+    RetrieverError,
+    RetrieverValidationError,
+    VectorRetriever,
+    get_retriever,
 )
 from .text_cleaner import (
     TextCleaner,
@@ -89,5 +107,22 @@ __all__ = [
     "VectorStoreCollectionNotFoundError",
     "chunk_id_to_point_id",
     "get_vector_store_service",
+    # Retriever
+    "BaseRetriever",
+    "VectorRetriever",
+    "RetrieverError",
+    "RetrieverValidationError",
+    "get_retriever",
+    # LLM
+    "BaseLLMService",
+    "MockLLMService",
+    "OpenAIChatService",
+    "LLMError",
+    "LLMConfigurationError",
+    "LLMProviderError",
+    "LLMResponseError",
+    "LLMValidationError",
+    "get_llm_service",
 ]
+
 

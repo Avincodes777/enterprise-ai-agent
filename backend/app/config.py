@@ -6,6 +6,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_EMBEDDING_PROVIDERS: Set[str] = {"fastembed", "openai"}
+SUPPORTED_LLM_PROVIDERS: Set[str] = {"mock", "openai"}
 
 
 class Settings(BaseSettings):
@@ -53,6 +54,31 @@ class Settings(BaseSettings):
         gt=0.0,
         validation_alias="EMBEDDING_TIMEOUT_SECONDS",
         description="Timeout in seconds for embedding generation requests",
+    )
+
+    # LLM Configuration
+    llm_provider: str = Field(
+        default="mock",
+        validation_alias="LLM_PROVIDER",
+        description="Active LLM provider ('mock' or 'openai')",
+    )
+    llm_model: str = Field(
+        default="gpt-4o-mini",
+        validation_alias="LLM_MODEL",
+        description="LLM model identifier",
+    )
+    llm_temperature: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        validation_alias="LLM_TEMPERATURE",
+        description="Default generation temperature (0.0 to 2.0)",
+    )
+    llm_max_tokens: Optional[int] = Field(
+        default=None,
+        gt=0,
+        validation_alias="LLM_MAX_TOKENS",
+        description="Optional default maximum generation tokens",
     )
 
     # Optional Provider Credentials
@@ -117,6 +143,49 @@ class Settings(BaseSettings):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("EMBEDDING_MODEL cannot be empty or whitespace-only")
         return value.strip()
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def validate_llm_provider(cls, value: str) -> str:
+        """Validate and normalize the LLM provider name."""
+        if not isinstance(value, str):
+            raise ValueError(f"LLM_PROVIDER must be a string, got {type(value).__name__}")
+
+        normalized = value.strip().lower()
+        if normalized not in SUPPORTED_LLM_PROVIDERS:
+            supported = ", ".join(f"'{p}'" for p in sorted(SUPPORTED_LLM_PROVIDERS))
+            raise ValueError(
+                f"Unsupported LLM provider: '{value}'. Supported providers are: {supported}"
+            )
+        return normalized
+
+    @field_validator("llm_model")
+    @classmethod
+    def validate_llm_model(cls, value: str) -> str:
+        """Validate that the LLM model identifier is not empty."""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("LLM_MODEL cannot be empty or whitespace-only")
+        return value.strip()
+
+    @field_validator("llm_temperature")
+    @classmethod
+    def validate_llm_temperature(cls, value: float) -> float:
+        """Validate that the generation temperature is numeric and within [0.0, 2.0]."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("LLM_TEMPERATURE must be a numeric value")
+        if value < 0.0 or value > 2.0:
+            raise ValueError("LLM_TEMPERATURE must be between 0.0 and 2.0")
+        return float(value)
+
+    @field_validator("llm_max_tokens")
+    @classmethod
+    def validate_llm_max_tokens(cls, value: Optional[int]) -> Optional[int]:
+        """Validate that LLM_MAX_TOKENS is None or a strictly positive integer."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("LLM_MAX_TOKENS must be a positive integer")
+        return value
 
     @field_validator("qdrant_collection_name")
     @classmethod
