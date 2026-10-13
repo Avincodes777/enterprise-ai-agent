@@ -17,6 +17,14 @@ from .embedding import (
     MockEmbeddingService,
     get_embedding_service,
 )
+from .ingestion import (
+    IngestionEmptyDocumentError,
+    IngestionError,
+    IngestionResult,
+    IngestionService,
+    IngestionValidationError,
+    get_ingestion_service,
+)
 from .llm import (
     BaseLLMService,
     LLMConfigurationError,
@@ -123,6 +131,13 @@ __all__ = [
     "LLMResponseError",
     "LLMValidationError",
     "get_llm_service",
+    # Ingestion
+    "IngestionService",
+    "IngestionResult",
+    "IngestionError",
+    "IngestionValidationError",
+    "IngestionEmptyDocumentError",
+    "get_ingestion_service",
 ]
 
 
