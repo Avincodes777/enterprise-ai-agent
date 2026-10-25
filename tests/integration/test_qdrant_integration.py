@@ -183,6 +183,109 @@ class TestQdrantLiveIntegration(unittest.TestCase):
         self.assertTrue(delete_success)
         self.assertFalse(self.vector_store.collection_exists(self.test_collection_name))
 
+    def test_live_document_scoped_vector_deletion(self):
+        """
+        Verify document-scoped point deletion in live Qdrant container:
+        1. Create test collection with dimension matching FastEmbed embeddings.
+        2. Insert multiple points for doc_A, doc_B, and a legacy point (document_id=None).
+        3. Verify total point count.
+        4. Delete unknown document ID -> returns 0, all points remain.
+        5. Delete doc_A by exact document ID -> returns exact count of doc_A points.
+        6. Verify doc_A points are gone and doc_B points remain searchable.
+        7. Verify legacy point with no document ID remains intact.
+        8. Verify collection is not deleted by document deletion.
+        """
+        self.vector_store.create_collection(
+            collection_name=self.test_collection_name,
+            dimension=self.settings.embedding_dimension,
+            recreate_if_exists=True,
+        )
+
+        # Generate vectors
+        vec_a1 = self.embedding_service.embed_query("Alpha document section 1")
+        vec_a2 = self.embedding_service.embed_query("Alpha document section 2")
+        vec_b1 = self.embedding_service.embed_query("Beta document section 1")
+        vec_legacy = self.embedding_service.embed_query("Legacy unversioned section")
+
+        points = [
+            VectorPoint(
+                chunk_id="doc_a_chunk_1",
+                document_id="doc_alpha_live",
+                vector=vec_a1,
+                document_name="alpha.pdf",
+                page_number=1,
+                chunk_index=0,
+                text="Alpha document section 1",
+            ),
+            VectorPoint(
+                chunk_id="doc_a_chunk_2",
+                document_id="doc_alpha_live",
+                vector=vec_a2,
+                document_name="alpha.pdf",
+                page_number=2,
+                chunk_index=0,
+                text="Alpha document section 2",
+            ),
+            VectorPoint(
+                chunk_id="doc_b_chunk_1",
+                document_id="doc_beta_live",
+                vector=vec_b1,
+                document_name="beta.pdf",
+                page_number=1,
+                chunk_index=0,
+                text="Beta document section 1",
+            ),
+            VectorPoint(
+                chunk_id="doc_legacy_chunk",
+                document_id=None,
+                vector=vec_legacy,
+                document_name="legacy.pdf",
+                page_number=1,
+                chunk_index=0,
+                text="Legacy unversioned section",
+            ),
+        ]
+
+        self.vector_store.upsert_vectors(points, collection_name=self.test_collection_name)
+        self.assertEqual(self.vector_store.count(self.test_collection_name), 4)
+
+        # 1. Deleting unknown document ID returns 0 and leaves points untouched
+        zero_deleted = self.vector_store.delete_by_document_id(
+            "doc_unknown_live", collection_name=self.test_collection_name
+        )
+        self.assertEqual(zero_deleted, 0)
+        self.assertEqual(self.vector_store.count(self.test_collection_name), 4)
+
+        # 2. Delete doc_A by exact document ID
+        deleted_count = self.vector_store.delete_by_document_id(
+            "doc_alpha_live", collection_name=self.test_collection_name
+        )
+        self.assertEqual(deleted_count, 2)
+        self.assertEqual(self.vector_store.count(self.test_collection_name), 2)
+
+        # 3. Verify doc_B points remain and are searchable
+        search_results = self.vector_store.search(
+            query_vector=vec_b1,
+            top_k=5,
+            collection_name=self.test_collection_name,
+        )
+        found_beta = [r for r in search_results if r.document_id == "doc_beta_live"]
+        self.assertEqual(len(found_beta), 1)
+        self.assertEqual(found_beta[0].chunk_id, "doc_b_chunk_1")
+
+        # 4. Verify no doc_A points exist
+        found_alpha = [r for r in search_results if r.document_id == "doc_alpha_live"]
+        self.assertEqual(len(found_alpha), 0)
+
+        # 5. Verify legacy point without document_id remains intact
+        legacy_found = [r for r in search_results if r.chunk_id == "doc_legacy_chunk"]
+        self.assertEqual(len(legacy_found), 1)
+        self.assertIsNone(legacy_found[0].document_id)
+
+        # 6. Verify collection still exists
+        self.assertTrue(self.vector_store.collection_exists(self.test_collection_name))
+
 
 if __name__ == "__main__":
     unittest.main()
+

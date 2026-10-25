@@ -171,7 +171,61 @@ class TestConfig(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Settings(_env_file=None)
 
+    def test_default_max_upload_size_bytes(self):
+        """18. Verify default MAX_UPLOAD_SIZE_BYTES is 25 MiB (26214400 bytes)."""
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings(_env_file=None)
+            self.assertEqual(settings.max_upload_size_bytes, 25 * 1024 * 1024)
+            self.assertEqual(settings.max_upload_size_bytes, 26214400)
+
+    def test_max_upload_size_bytes_env_override(self):
+        """19. Verify MAX_UPLOAD_SIZE_BYTES and MAX_PDF_SIZE_BYTES env overrides."""
+        with patch.dict(os.environ, {"MAX_UPLOAD_SIZE_BYTES": "10485760"}, clear=True):
+            settings = Settings(_env_file=None)
+            self.assertEqual(settings.max_upload_size_bytes, 10485760)
+
+        with patch.dict(os.environ, {"MAX_PDF_SIZE_BYTES": "5242880"}, clear=True):
+            settings = Settings(_env_file=None)
+            self.assertEqual(settings.max_upload_size_bytes, 5242880)
+
+    def test_invalid_max_upload_size_bytes_raises_validation_error(self):
+        """20. Verify non-positive MAX_UPLOAD_SIZE_BYTES raises validation error."""
+        with patch.dict(os.environ, {"MAX_UPLOAD_SIZE_BYTES": "0"}, clear=True):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
+        with patch.dict(os.environ, {"MAX_UPLOAD_SIZE_BYTES": "-100"}, clear=True):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
+    def test_default_sqlite_db_path(self):
+        """21. Verify default SQLITE_DB_PATH is 'data/document_registry.db'."""
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings(_env_file=None)
+            self.assertEqual(settings.sqlite_db_path, "data/document_registry.db")
+
+    def test_sqlite_db_path_env_override(self):
+        """22. Verify SQLITE_DB_PATH and DOCUMENT_REGISTRY_DB_PATH env overrides."""
+        with patch.dict(os.environ, {"SQLITE_DB_PATH": "custom/path.db"}, clear=True):
+            settings = Settings(_env_file=None)
+            self.assertEqual(settings.sqlite_db_path, "custom/path.db")
+
+        with patch.dict(os.environ, {"DOCUMENT_REGISTRY_DB_PATH": "alt/registry.db"}, clear=True):
+            settings = Settings(_env_file=None)
+            self.assertEqual(settings.sqlite_db_path, "alt/registry.db")
+
+    def test_invalid_sqlite_db_path_raises_validation_error(self):
+        """23. Verify empty or whitespace SQLITE_DB_PATH raises validation error."""
+        with patch.dict(os.environ, {"SQLITE_DB_PATH": ""}, clear=True):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
+        with patch.dict(os.environ, {"SQLITE_DB_PATH": "   "}, clear=True):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

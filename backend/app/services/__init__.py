@@ -72,6 +72,13 @@ from .vector_store import (
     chunk_id_to_point_id,
     get_vector_store_service,
 )
+from .reconciliation import (
+    DocumentReconciliationOutcome,
+    ReconciliationOutcomeStatus,
+    ReconciliationResult,
+    ReconciliationService,
+    get_reconciliation_service,
+)
 
 __all__ = [
     # PDF Loader
@@ -138,6 +145,12 @@ __all__ = [
     "IngestionValidationError",
     "IngestionEmptyDocumentError",
     "get_ingestion_service",
+    # Reconciliation
+    "ReconciliationService",
+    "ReconciliationOutcomeStatus",
+    "DocumentReconciliationOutcome",
+    "ReconciliationResult",
+    "get_reconciliation_service",
 ]
 
 

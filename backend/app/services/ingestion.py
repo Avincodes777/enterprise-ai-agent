@@ -1,7 +1,8 @@
 """Document ingestion orchestration service for processing, embedding, and vector storage."""
 
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
+import uuid
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
@@ -119,6 +120,8 @@ class IngestionService:
         file_bytes: bytes,
         document_name: str,
         collection_name: Optional[str] = None,
+        document_id: Optional[str] = None,
+        heartbeat_callback: Optional[Callable[[], None]] = None,
     ) -> IngestionResult:
         """
         Ingest a PDF from in-memory bytes, clean, chunk, embed, and upsert to vector store.
@@ -127,12 +130,16 @@ class IngestionService:
             file_bytes: Raw bytes of the PDF file.
             document_name: Human-readable name or identifier for the document.
             collection_name: Optional target vector collection name override.
+            document_id: Optional persistent unique document identifier. If omitted,
+                         a unique fallback identity is generated to prevent point collisions.
+            heartbeat_callback: Optional callback invoked before long-running stages to renew
+                                document activity timestamp and verify ongoing processing state.
 
         Returns:
             IngestionResult summarizing the ingestion execution.
 
         Raises:
-            IngestionValidationError: If input bytes or document name are invalid.
+            IngestionValidationError: If input bytes, document name, document ID, or callback are invalid.
             IngestionEmptyDocumentError: If the document contains no extractable text.
             IngestionError: If PDF loading, embedding, or vector storage fails.
         """
@@ -150,12 +157,22 @@ class IngestionService:
             raise IngestionValidationError("document_name cannot be empty or whitespace-only")
         clean_doc_name = document_name.strip()
 
+        if document_id is not None:
+            if not isinstance(document_id, str) or not document_id.strip():
+                raise IngestionValidationError("document_id cannot be empty or whitespace-only")
+            clean_doc_id = document_id.strip()
+        else:
+            clean_doc_id = f"doc_{uuid.uuid4().hex[:16]}"
+
         if collection_name is not None:
             if not isinstance(collection_name, str) or not collection_name.strip():
                 raise IngestionValidationError("collection_name cannot be empty or whitespace-only")
             target_collection = collection_name.strip()
         else:
             target_collection = self._default_collection_name
+
+        if heartbeat_callback is not None and not callable(heartbeat_callback):
+            raise IngestionValidationError("heartbeat_callback must be callable if provided")
 
         # Step 2: Load PDF from bytes
         try:
@@ -196,6 +213,10 @@ class IngestionService:
                 f"No chunks could be extracted from PDF document '{clean_doc_name}'"
             )
 
+        # Checkpoint 1: Immediately before document embedding begins
+        if heartbeat_callback is not None:
+            heartbeat_callback()
+
         # Step 5: Generate embeddings
         chunk_texts = [chunk.text for chunk in chunks]
         try:
@@ -213,19 +234,28 @@ class IngestionService:
                 f"expected {len(chunks)} embeddings, got {len(embeddings)}"
             )
 
-        # Step 7: Construct VectorPoint objects
-        points = [
-            VectorPoint(
-                chunk_id=chunk.chunk_id,
-                vector=vec,
-                document_name=chunk.metadata.get("document_name", clean_doc_name),
-                page_number=chunk.page_number,
-                chunk_index=chunk.metadata.get("chunk_index", idx),
-                text=chunk.text,
-                metadata=chunk.metadata,
+        # Step 7: Construct VectorPoint objects with document identity provenance
+        points = []
+        for idx, (chunk, vec) in enumerate(zip(chunks, embeddings)):
+            scoped_chunk_id = f"{clean_doc_id}_{chunk.chunk_id}"
+            chunk_metadata = dict(chunk.metadata)
+            chunk_metadata["document_id"] = clean_doc_id
+            points.append(
+                VectorPoint(
+                    chunk_id=scoped_chunk_id,
+                    document_id=clean_doc_id,
+                    vector=vec,
+                    document_name=chunk.metadata.get("document_name", clean_doc_name),
+                    page_number=chunk.page_number,
+                    chunk_index=chunk.metadata.get("chunk_index", idx),
+                    text=chunk.text,
+                    metadata=chunk_metadata,
+                )
             )
-            for idx, (chunk, vec) in enumerate(zip(chunks, embeddings))
-        ]
+
+        # Checkpoint 2: Immediately after embedding completes and before vector-store collection setup or upsert proceeds
+        if heartbeat_callback is not None:
+            heartbeat_callback()
 
         # Step 8: Verify / create target collection if missing
         try:
@@ -260,7 +290,7 @@ class IngestionService:
             chunks_created=len(chunks),
             chunks_stored=stored_count,
             collection_name=target_collection,
-            chunk_ids=[c.chunk_id for c in chunks],
+            chunk_ids=[p.chunk_id for p in points],
         )
 
 

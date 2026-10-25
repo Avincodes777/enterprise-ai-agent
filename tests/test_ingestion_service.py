@@ -32,6 +32,7 @@ from app.services import (
     VectorStoreError,
     get_ingestion_service,
 )
+from app.database.registry import DocumentStateConflictError
 
 
 class TestIngestionService(unittest.TestCase):
@@ -207,7 +208,10 @@ class TestIngestionService(unittest.TestCase):
             self.assertEqual(pt.document_name, self.doc_name)
             self.assertEqual(pt.page_number, idx + 1)
             self.assertEqual(pt.vector, self.sample_vectors[idx])
-            self.assertTrue(pt.chunk_id.startswith("security_policy_p"))
+            self.assertTrue(pt.chunk_id.endswith(f"_security_policy_p{idx + 1}_c0"))
+            self.assertTrue(pt.chunk_id.startswith("doc_"))
+            self.assertIsNotNone(pt.document_id)
+            self.assertTrue(pt.document_id.startswith("doc_"))
 
     # -------------------------------------------------------------------------
     # 9. Metadata Preservation
@@ -257,7 +261,9 @@ class TestIngestionService(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_ingestion_result_fields_are_correct(self):
         """12. Verify all attributes in IngestionResult contain accurate values."""
-        result = self.service.ingest_pdf(self.sample_bytes, self.doc_name)
+        result = self.service.ingest_pdf(
+            self.sample_bytes, self.doc_name, document_id="doc_test_fixed_id"
+        )
 
         self.assertEqual(result.document_name, self.doc_name)
         self.assertEqual(result.pages_processed, 2)
@@ -266,7 +272,7 @@ class TestIngestionService(unittest.TestCase):
         self.assertEqual(result.collection_name, "enterprise_knowledge")
         self.assertEqual(
             result.chunk_ids,
-            ["security_policy_p1_c0", "security_policy_p2_c0"],
+            ["doc_test_fixed_id_security_policy_p1_c0", "doc_test_fixed_id_security_policy_p2_c0"],
         )
 
     # -------------------------------------------------------------------------
@@ -366,15 +372,182 @@ class TestIngestionService(unittest.TestCase):
     # 17. Repeated Deterministic Input Preserves Chunk IDs
     # -------------------------------------------------------------------------
     def test_repeated_deterministic_input_preserves_chunk_ids(self):
-        """17. Verify identical document input processed twice produces identical chunk IDs."""
-        result_1 = self.service.ingest_pdf(self.sample_bytes, self.doc_name)
-        result_2 = self.service.ingest_pdf(self.sample_bytes, self.doc_name)
+        """17. Verify identical document input with same document_id produces identical chunk IDs."""
+        result_1 = self.service.ingest_pdf(
+            self.sample_bytes, self.doc_name, document_id="doc_retry_123"
+        )
+        result_2 = self.service.ingest_pdf(
+            self.sample_bytes, self.doc_name, document_id="doc_retry_123"
+        )
 
         self.assertEqual(result_1.chunk_ids, result_2.chunk_ids)
         self.assertEqual(
             result_1.chunk_ids,
-            ["security_policy_p1_c0", "security_policy_p2_c0"],
+            ["doc_retry_123_security_policy_p1_c0", "doc_retry_123_security_policy_p2_c0"],
         )
+
+    # -------------------------------------------------------------------------
+    # 18. Same Filename With Different Document IDs Produces Distinct IDs
+    # -------------------------------------------------------------------------
+    def test_same_filename_different_document_ids_produce_distinct_ids(self):
+        """18. Verify identical filename with different document IDs produces distinct chunk and point IDs."""
+        from app.services.vector_store import chunk_id_to_point_id
+
+        r1 = self.service.ingest_pdf(
+            self.sample_bytes, self.doc_name, document_id="doc_upload_first"
+        )
+        r2 = self.service.ingest_pdf(
+            self.sample_bytes, self.doc_name, document_id="doc_upload_second"
+        )
+
+        self.assertNotEqual(r1.chunk_ids, r2.chunk_ids)
+        for c1, c2 in zip(r1.chunk_ids, r2.chunk_ids):
+            self.assertNotEqual(c1, c2)
+            pt_id1 = chunk_id_to_point_id(c1)
+            pt_id2 = chunk_id_to_point_id(c2)
+            self.assertNotEqual(pt_id1, pt_id2)
+
+    # -------------------------------------------------------------------------
+    # 19. Omitted Document ID Generates Unique Fallback Identity
+    # -------------------------------------------------------------------------
+    def test_omitted_document_id_generates_unique_fallback_identity(self):
+        """19. Verify omitted document_id generates distinct fallback identities per run."""
+        r1 = self.service.ingest_pdf(self.sample_bytes, self.doc_name)
+        r2 = self.service.ingest_pdf(self.sample_bytes, self.doc_name)
+
+        self.assertNotEqual(r1.chunk_ids, r2.chunk_ids)
+        self.assertTrue(r1.chunk_ids[0].startswith("doc_"))
+        self.assertTrue(r2.chunk_ids[0].startswith("doc_"))
+
+    # -------------------------------------------------------------------------
+    # 20. Stored VectorPoints Contain Document ID in Payload and Metadata
+    # -------------------------------------------------------------------------
+    def test_stored_vector_points_contain_document_id(self):
+        """20. Verify VectorPoint contains document_id at top level and in metadata."""
+        custom_id = "doc_provenance_test_999"
+        self.service.ingest_pdf(self.sample_bytes, self.doc_name, document_id=custom_id)
+
+        points = self.mock_vector_store.upsert_vectors.call_args[1].get(
+            "points"
+        ) or self.mock_vector_store.upsert_vectors.call_args[0][0]
+
+        for pt in points:
+            self.assertEqual(pt.document_id, custom_id)
+            self.assertEqual(pt.metadata.get("document_id"), custom_id)
+
+    # -------------------------------------------------------------------------
+    # 21. Invalid Document ID Raises IngestionValidationError
+    # -------------------------------------------------------------------------
+    def test_invalid_document_id_raises_validation_error(self):
+        """21. Verify empty or whitespace-only document_id raises IngestionValidationError."""
+        for invalid_id in ["", "   ", " \t "]:
+            with self.subTest(document_id=invalid_id):
+                with self.assertRaises(IngestionValidationError):
+                    self.service.ingest_pdf(
+                        self.sample_bytes, self.doc_name, document_id=invalid_id
+                    )
+
+    # -------------------------------------------------------------------------
+    # 22. Heartbeat Callback Invoked at Intended Checkpoints
+    # -------------------------------------------------------------------------
+    def test_heartbeat_callback_invoked_at_checkpoints(self):
+        """22. Verify heartbeat_callback is called exactly twice at intended pipeline checkpoints."""
+        events = []
+
+        def tracked_callback():
+            events.append("heartbeat")
+
+        orig_embed = self.mock_embedder.embed_documents.side_effect
+        def tracked_embed(texts):
+            events.append("embed")
+            return [[0.05] * 384, [0.10] * 384]
+        self.mock_embedder.embed_documents.side_effect = tracked_embed
+
+        def tracked_upsert(points, collection_name):
+            events.append("upsert")
+            return len(points)
+        self.mock_vector_store.upsert_vectors.side_effect = tracked_upsert
+
+        result = self.service.ingest_pdf(
+            self.sample_bytes,
+            self.doc_name,
+            heartbeat_callback=tracked_callback,
+        )
+
+        self.assertIsInstance(result, IngestionResult)
+        # Checkpoints: 1) before embedding, 2) after embedding before vector store operations
+        self.assertEqual(events, ["heartbeat", "embed", "heartbeat", "upsert"])
+
+    # -------------------------------------------------------------------------
+    # 23. Heartbeat Conflict Before Embedding Prevents Embedding
+    # -------------------------------------------------------------------------
+    def test_heartbeat_conflict_before_embedding_prevents_embedding(self):
+        """23. Verify DocumentStateConflictError before embedding halts pipeline without embedding or vector ops."""
+        mock_callback = MagicMock(
+            side_effect=DocumentStateConflictError("Cannot renew heartbeat: status is 'failed'")
+        )
+
+        with self.assertRaises(DocumentStateConflictError):
+            self.service.ingest_pdf(
+                self.sample_bytes,
+                self.doc_name,
+                heartbeat_callback=mock_callback,
+            )
+
+        self.assertEqual(mock_callback.call_count, 1)
+        self.mock_embedder.embed_documents.assert_not_called()
+        self.mock_vector_store.collection_exists.assert_not_called()
+        self.mock_vector_store.upsert_vectors.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # 24. Heartbeat Conflict After Embedding Prevents Upsert
+    # -------------------------------------------------------------------------
+    def test_heartbeat_conflict_after_embedding_prevents_upsert(self):
+        """24. Verify DocumentStateConflictError after embedding prevents vector-store collection setup and upsert."""
+        # 1st call (before embedding) succeeds; 2nd call (after embedding) raises conflict
+        mock_callback = MagicMock(
+            side_effect=[
+                None,
+                DocumentStateConflictError("Cannot renew heartbeat: status is 'deleting'"),
+            ]
+        )
+
+        with self.assertRaises(DocumentStateConflictError):
+            self.service.ingest_pdf(
+                self.sample_bytes,
+                self.doc_name,
+                heartbeat_callback=mock_callback,
+            )
+
+        self.assertEqual(mock_callback.call_count, 2)
+        # Embedding completed
+        self.mock_embedder.embed_documents.assert_called_once()
+        # Vector store was not touched
+        self.mock_vector_store.collection_exists.assert_not_called()
+        self.mock_vector_store.upsert_vectors.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # 25. Heartbeat Callback Validation
+    # -------------------------------------------------------------------------
+    def test_heartbeat_callback_validation(self):
+        """25. Verify non-callable heartbeat_callback raises IngestionValidationError."""
+        with self.assertRaises(IngestionValidationError):
+            self.service.ingest_pdf(
+                self.sample_bytes,
+                self.doc_name,
+                heartbeat_callback="not_callable",  # type: ignore
+            )
+
+    # -------------------------------------------------------------------------
+    # 26. Backward Compatibility When Callback Is Omitted
+    # -------------------------------------------------------------------------
+    def test_heartbeat_callback_omitted_is_backward_compatible(self):
+        """26. Verify callers omitting heartbeat_callback execute normally without errors."""
+        result = self.service.ingest_pdf(self.sample_bytes, self.doc_name)
+        self.assertIsInstance(result, IngestionResult)
+        self.assertEqual(result.document_name, self.doc_name)
+        self.mock_embedder.embed_documents.assert_called_once()
+        self.mock_vector_store.upsert_vectors.assert_called_once()
 
 
 if __name__ == "__main__":

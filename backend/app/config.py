@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from typing import Optional, Set
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_EMBEDDING_PROVIDERS: Set[str] = {"fastembed", "openai"}
@@ -24,6 +24,14 @@ class Settings(BaseSettings):
         default="development",
         validation_alias="APP_ENV",
         description="Application runtime environment (development, staging, production, test)",
+    )
+
+    # Ingestion & Upload Configuration
+    max_upload_size_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        gt=0,
+        validation_alias=AliasChoices("MAX_UPLOAD_SIZE_BYTES", "MAX_PDF_SIZE_BYTES"),
+        description="Maximum allowed PDF upload size in bytes (default 25 MiB: 26214400 bytes)",
     )
 
     # Embedding Configuration
@@ -120,6 +128,27 @@ class Settings(BaseSettings):
         validation_alias="REDIS_URL",
         description="Redis cache connection string",
     )
+    sqlite_db_path: str = Field(
+        default="data/document_registry.db",
+        validation_alias=AliasChoices("SQLITE_DB_PATH", "DOCUMENT_REGISTRY_DB_PATH"),
+        description="Path to SQLite database file for persistent document registry",
+    )
+
+    @field_validator("sqlite_db_path")
+    @classmethod
+    def validate_sqlite_db_path(cls, value: str) -> str:
+        """Validate that sqlite_db_path is a non-empty string."""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("SQLITE_DB_PATH cannot be empty or whitespace-only")
+        return value.strip()
+
+    @field_validator("max_upload_size_bytes")
+    @classmethod
+    def validate_max_upload_size_bytes(cls, value: int) -> int:
+        """Validate that max_upload_size_bytes is a strictly positive integer."""
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("MAX_UPLOAD_SIZE_BYTES must be a positive integer")
+        return value
 
     @field_validator("embedding_provider", mode="before")
     @classmethod
@@ -200,3 +229,8 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return a cached singleton instance of application Settings."""
     return Settings()
+
+
+def reset_settings_cache() -> None:
+    """Clear the cached shared Settings instance."""
+    get_settings.cache_clear()

@@ -61,6 +61,9 @@ class VectorPoint(BaseModel):
 
     chunk_id: str = Field(..., description="Unique chunk identifier")
     vector: List[float] = Field(..., description="Dense float vector embedding")
+    document_id: Optional[str] = Field(
+        default=None, description="Persistent unique document identifier"
+    )
     document_name: str = Field(default="", description="Source document file name")
     page_number: int = Field(default=1, description="1-indexed source page number")
     chunk_index: int = Field(default=0, description="0-indexed chunk index within page/doc")
@@ -74,6 +77,9 @@ class VectorSearchResult(BaseModel):
     """Represents a scored vector search result with source provenance."""
 
     chunk_id: str = Field(..., description="Unique chunk identifier")
+    document_id: Optional[str] = Field(
+        default=None, description="Persistent unique document identifier if present"
+    )
     document_name: str = Field(default="", description="Source document file name")
     page_number: int = Field(default=1, description="1-indexed source page number")
     chunk_index: int = Field(default=0, description="0-indexed chunk index within page/doc")
@@ -196,6 +202,60 @@ class BaseVectorStoreService(ABC):
 
         Returns:
             True if collection was deleted, False if it did not exist.
+        """
+        pass
+
+    @abstractmethod
+    def delete_by_document_id(
+        self,
+        document_id: str,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        """
+        Delete all vector points belonging to the specified document ID.
+
+        Args:
+            document_id: Unique persistent identifier of the document.
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            The number of points deleted.
+        """
+        pass
+
+    @abstractmethod
+    def count_by_document_id(
+        self,
+        document_id: str,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        """
+        Count all vector points belonging to the specified document ID.
+
+        Args:
+            document_id: Unique persistent identifier of the document.
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            The number of matching points.
+        """
+        pass
+
+    @abstractmethod
+    def create_payload_index(
+        self,
+        field_name: str,
+        collection_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Create a keyword payload index on the specified field for fast filtering.
+
+        Args:
+            field_name: Name of payload field to index (e.g. 'document_id').
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            True if index was created or already exists.
         """
         pass
 
@@ -342,6 +402,7 @@ class QdrantVectorStoreService(BaseVectorStoreService):
             point_id = chunk_id_to_point_id(pt.chunk_id)
             payload = {
                 "chunk_id": pt.chunk_id,
+                "document_id": pt.document_id,
                 "document_name": pt.document_name,
                 "page_number": pt.page_number,
                 "chunk_index": pt.chunk_index,
@@ -400,6 +461,7 @@ class QdrantVectorStoreService(BaseVectorStoreService):
             for pt in scored_points:
                 raw_payload = getattr(pt, "payload", None) or {}
                 chunk_id = str(raw_payload.get("chunk_id") or pt.id)
+                document_id = raw_payload.get("document_id")
                 document_name = str(raw_payload.get("document_name") or "")
                 page_number = int(raw_payload.get("page_number", 1))
                 chunk_index = int(raw_payload.get("chunk_index", 0))
@@ -413,6 +475,7 @@ class QdrantVectorStoreService(BaseVectorStoreService):
                 results.append(
                     VectorSearchResult(
                         chunk_id=chunk_id,
+                        document_id=document_id,
                         document_name=document_name,
                         page_number=page_number,
                         chunk_index=chunk_index,
@@ -456,6 +519,177 @@ class QdrantVectorStoreService(BaseVectorStoreService):
             raise VectorStoreError(
                 f"Failed to delete collection '{col}': {exc}"
             ) from exc
+
+    def delete_by_document_id(
+        self,
+        document_id: str,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        """
+        Delete all vector points belonging to the specified document ID.
+
+        Args:
+            document_id: Unique persistent identifier of the document.
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            The number of points deleted.
+
+        Raises:
+            VectorStoreValidationError: If document_id or collection_name is invalid.
+            VectorStoreCollectionNotFoundError: If the target collection does not exist.
+            VectorStoreError: If Qdrant communication or deletion fails.
+        """
+        if not document_id or not isinstance(document_id, str) or not document_id.strip():
+            raise VectorStoreValidationError("document_id must be a non-empty string")
+        clean_doc_id = document_id.strip()
+
+        col = self._resolve_collection_name(collection_name)
+        if not self.collection_exists(col):
+            raise VectorStoreCollectionNotFoundError(
+                f"Collection '{col}' does not exist"
+            )
+
+        from qdrant_client import models
+
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=clean_doc_id),
+                )
+            ]
+        )
+
+        try:
+            count_res = self._client.count(
+                collection_name=col,
+                count_filter=doc_filter,
+                exact=True,
+            )
+            matching_count = int(count_res.count)
+
+            update_result = self._client.delete(
+                collection_name=col,
+                points_selector=models.FilterSelector(filter=doc_filter),
+                wait=True,
+            )
+
+            status_val = getattr(update_result, "status", None)
+            if status_val is not None:
+                if (
+                    status_val == models.UpdateStatus.WAIT_TIMEOUT
+                    or str(status_val).lower() == "wait_timeout"
+                ):
+                    raise VectorStoreError(
+                        f"Deletion of document '{clean_doc_id}' in collection '{col}' timed out."
+                    )
+
+            return matching_count
+        except VectorStoreError:
+            raise
+        except Exception as exc:
+            raise VectorStoreError(
+                f"Failed to delete points for document '{clean_doc_id}' in collection '{col}': {exc}"
+            ) from exc
+
+    def count_by_document_id(
+        self,
+        document_id: str,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        """
+        Count all vector points belonging to the specified document ID.
+
+        Args:
+            document_id: Unique persistent identifier of the document.
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            The number of matching points.
+
+        Raises:
+            VectorStoreValidationError: If document_id is invalid.
+            VectorStoreCollectionNotFoundError: If the target collection does not exist.
+            VectorStoreError: If Qdrant communication fails.
+        """
+        if not document_id or not isinstance(document_id, str) or not document_id.strip():
+            raise VectorStoreValidationError("document_id must be a non-empty string")
+        clean_doc_id = document_id.strip()
+
+        col = self._resolve_collection_name(collection_name)
+        if not self.collection_exists(col):
+            raise VectorStoreCollectionNotFoundError(
+                f"Collection '{col}' does not exist"
+            )
+
+        from qdrant_client import models
+
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=clean_doc_id),
+                )
+            ]
+        )
+
+        try:
+            count_res = self._client.count(
+                collection_name=col,
+                count_filter=doc_filter,
+                exact=True,
+            )
+            return int(count_res.count)
+        except VectorStoreError:
+            raise
+        except Exception as exc:
+            raise VectorStoreError(
+                f"Failed to count points for document '{clean_doc_id}' in collection '{col}': {exc}"
+            ) from exc
+
+    def create_payload_index(
+        self,
+        field_name: str,
+        collection_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Create a keyword payload index on the specified field for fast filtering.
+
+        Args:
+            field_name: Name of payload field to index (e.g. 'document_id').
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            True if index was created or already exists.
+        """
+        if not field_name or not isinstance(field_name, str) or not field_name.strip():
+            raise VectorStoreValidationError("field_name must be a non-empty string")
+        clean_field = field_name.strip()
+
+        col = self._resolve_collection_name(collection_name)
+        if not self.collection_exists(col):
+            raise VectorStoreCollectionNotFoundError(
+                f"Collection '{col}' does not exist"
+            )
+
+        from qdrant_client import models
+
+        try:
+            self._client.create_payload_index(
+                collection_name=col,
+                field_name=clean_field,
+                field_schema=models.PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
+            return True
+        except VectorStoreError:
+            raise
+        except Exception as exc:
+            raise VectorStoreError(
+                f"Failed to create payload index for field '{clean_field}' in collection '{col}': {exc}"
+            ) from exc
+
 
 
 # -----------------------------------------------------------------------------
@@ -547,6 +781,7 @@ class MockVectorStoreService(BaseVectorStoreService):
             point_id = chunk_id_to_point_id(pt.chunk_id)
             self._collections[col]["points"][point_id] = {
                 "chunk_id": pt.chunk_id,
+                "document_id": pt.document_id,
                 "vector": list(pt.vector),
                 "document_name": pt.document_name,
                 "page_number": pt.page_number,
@@ -599,6 +834,7 @@ class MockVectorStoreService(BaseVectorStoreService):
             scored_candidates.append(
                 VectorSearchResult(
                     chunk_id=pt_data["chunk_id"],
+                    document_id=pt_data.get("document_id"),
                     document_name=pt_data["document_name"],
                     page_number=pt_data["page_number"],
                     chunk_index=pt_data["chunk_index"],
@@ -625,6 +861,113 @@ class MockVectorStoreService(BaseVectorStoreService):
             del self._collections[col]
             return True
         return False
+
+    def delete_by_document_id(
+        self,
+        document_id: str,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        """
+        Delete all vector points belonging to the specified document ID.
+
+        Args:
+            document_id: Unique persistent identifier of the document.
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            The number of points deleted.
+
+        Raises:
+            VectorStoreValidationError: If document_id is invalid.
+            VectorStoreCollectionNotFoundError: If the collection does not exist.
+        """
+        if not document_id or not isinstance(document_id, str) or not document_id.strip():
+            raise VectorStoreValidationError("document_id must be a non-empty string")
+        clean_doc_id = document_id.strip()
+
+        col = self._resolve_collection_name(collection_name)
+        if col not in self._collections:
+            raise VectorStoreCollectionNotFoundError(
+                f"Collection '{col}' does not exist"
+            )
+
+        matching_point_ids = [
+            pid
+            for pid, pt_data in self._collections[col]["points"].items()
+            if pt_data.get("document_id") == clean_doc_id
+        ]
+
+        for pid in matching_point_ids:
+            del self._collections[col]["points"][pid]
+
+        return len(matching_point_ids)
+
+    def count_by_document_id(
+        self,
+        document_id: str,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        """
+        Count all vector points belonging to the specified document ID.
+
+        Args:
+            document_id: Unique persistent identifier of the document.
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            The number of matching points.
+
+        Raises:
+            VectorStoreValidationError: If document_id is invalid.
+            VectorStoreCollectionNotFoundError: If the collection does not exist.
+        """
+        if not document_id or not isinstance(document_id, str) or not document_id.strip():
+            raise VectorStoreValidationError("document_id must be a non-empty string")
+        clean_doc_id = document_id.strip()
+
+        col = self._resolve_collection_name(collection_name)
+        if col not in self._collections:
+            raise VectorStoreCollectionNotFoundError(
+                f"Collection '{col}' does not exist"
+            )
+
+        matching_points = [
+            pid
+            for pid, pt_data in self._collections[col]["points"].items()
+            if pt_data.get("document_id") == clean_doc_id
+        ]
+        return len(matching_points)
+
+    def create_payload_index(
+        self,
+        field_name: str,
+        collection_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Create a keyword payload index on the specified field for fast filtering.
+
+        Args:
+            field_name: Name of payload field to index (e.g. 'document_id').
+            collection_name: Optional collection name (defaults to configured collection).
+
+        Returns:
+            True if index was created or already exists.
+        """
+        if not field_name or not isinstance(field_name, str) or not field_name.strip():
+            raise VectorStoreValidationError("field_name must be a non-empty string")
+        clean_field = field_name.strip()
+
+        col = self._resolve_collection_name(collection_name)
+        if col not in self._collections:
+            raise VectorStoreCollectionNotFoundError(
+                f"Collection '{col}' does not exist"
+            )
+
+        if "indices" not in self._collections[col]:
+            self._collections[col]["indices"] = set()
+        self._collections[col]["indices"].add(clean_field)
+        return True
+
 
 
 # -----------------------------------------------------------------------------
